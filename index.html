@@ -236,6 +236,7 @@ pre.chart{margin:0;padding:10px 12px;border-radius:8px;background:var(--surface2
       <label class="check">템포 <input type="range" id="bpm" min="40" max="200" step="1"> <span class="key-readout" id="bpmv"></span></label>
       <label class="check"><input type="checkbox" id="pl-mel" checked> 멜로디</label>
       <label class="check"><input type="checkbox" id="pl-chd" checked> 코드 반주</label>
+      <select id="pl-ens" aria-label="편성"><option value="solo">편성: 솔로</option><option value="strings">편성: 현악 합주</option><option value="orch">편성: 오케스트라</option></select>
       <select id="pl-style" aria-label="반주 방식"></select>
       <select id="pl-lead" aria-label="멜로디 소리"><option value="inst">멜로디: 악기 소리</option><option value="lead">멜로디: 이어지는 소리</option></select>
       <label class="check"><input type="checkbox" id="pl-rit" checked> 끝을 천천히</label>
@@ -998,10 +999,55 @@ function makeTimeMap(total, bpm, rit) {
   return { sec, qAt, span, start };
 }
 
+
+// 오케스트라 편성: 현악 패드(보이스 리딩) + 첼로 베이스 + (오케스트라) 하프 아르페지오·호른·팀파니
+function orchestraParts(infoOut, slots, starts, total, shift, ens, jit, clampVel, events) {
+  const ss = [...slots].sort((a, b) => a.m - b.m || a.t - b.t);
+  const orch = ens === 'orch';
+  let prevPad = null, prevHorn = null;
+  const low = (pc, lo) => { let m = lo; while (mod(m, 12) !== pc) m++; return m; };
+  const add = (inst, t, dur, midi, vel, kind) => events.push({ t: Math.max(0, t + jit(0.01)), dur, midi, kind: kind || 'c', inst, vel: clampVel(vel + jit(0.03)) });
+  ss.forEach((sl, i) => {
+    const t = starts[sl.m] + sl.t, nx = ss[i + 1];
+    const end = nx ? starts[nx.m] + nx.t : total, dur = Math.max(0.5, end - t);
+    const M = infoOut.measures[sl.m], g = groupLen(M.ts);
+    const root = mod(sl.root + shift, 12), bass = sl.bass != null ? mod(sl.bass + shift, 12) : root;
+    const pcs = QUAL[sl.q].pcs.map((x) => mod(x + root, 12));
+    const lastChord = i === ss.length - 1;
+    // 현악 패드: 길면 8박 단위로 나눠 활을 다시 긋는다
+    prevPad = chordVoicing(pcs, prevPad, 55, 74);
+    for (let x = 0; x < dur - 1e-6; x += 8) {
+      const d = Math.min(8, dur - x) + (x + 8 < dur ? 0.15 : 0);
+      prevPad.forEach((m, k) => add('strings', t + x + k * 0.012, d, m, (orch ? 0.5 : 0.62) - k * 0.02));
+    }
+    // 첼로·콘트라베이스: 근음(또는 베이스음), 반마디마다 다시 연주
+    const bm = low(bass, 36), half = Math.max(g, (M.ts.beats * 4 / M.ts.type) / 2);
+    for (let x = 0; x < dur - 1e-6; x += half) {
+      const d = Math.min(half, dur - x) + 0.1;
+      add('cello', t + x, d, bm, x === 0 ? 0.9 : 0.7, 'b');
+    }
+    if (orch) {
+      // 하프: 코드음을 두 옥타브에 걸쳐 8분음표로 올랐다 내려온다
+      const base = chordVoicing(pcs, null, 48, 66);
+      const tones = [...base, ...base.map((m) => m + 12)].filter((m) => m <= 88);
+      const pat = [0, 1, 2, 3, 4, 3, 2, 1];
+      const step = g === 1.5 ? 0.5 : 0.5;
+      for (let x = 0, k = 0; x < dur - 1e-6; x += step, k++) add('harp', t + x, 1.8, tones[pat[k % pat.length] % tones.length], x === 0 ? 0.7 : 0.45);
+      // 호른: 코드가 2박 이상이면 부드러운 지속음(근음+5도)
+      if (dur >= 2) {
+        prevHorn = chordVoicing([pcs[0], pcs[2 % pcs.length]], prevHorn, 48, 66);
+        prevHorn.forEach((m) => add('horn', t, Math.min(dur, 8) + 0.1, m, 0.5));
+      }
+      if (lastChord) add('timp', t, 3, low(root, 38), 1, 'b');
+    }
+  });
+}
+
 // infoOut: 조옮김이 반영된 악보를 parseScore한 결과. 시간 단위는 4분음표.
 function buildPlayback(infoOut, slots, shift, opts) {
   opts = opts || {};
   const instrument = opts.instrument || 'guitar';
+  const ens = opts.ensemble === 'orch' || opts.ensemble === 'strings' ? opts.ensemble : null;
   const rand = rng(12345);
   const human = opts.human !== false;
   const jit = (amt) => (human ? (rand() - 0.5) * 2 * amt : 0);
@@ -1024,6 +1070,7 @@ function buildPlayback(infoOut, slots, shift, opts) {
         if (n.tieStop && open.has(key)) {
           const e = open.get(key);
           e.dur = t + n.dur - e.t;
+          if (e.twin) e.twin.dur = e.dur;
           if (!n.tieStart) open.delete(key);
           continue;
         }
@@ -1031,12 +1078,18 @@ function buildPlayback(infoOut, slots, shift, opts) {
         let v = Math.abs(pos) < 1e-6 ? 1.0 : Math.abs(mod(pos + 1e-6, g) - 1e-6) < 2e-6 ? 0.88 : pos % 1 === 0 ? 0.8 : 0.7;
         if (n.dur >= 2) v += 0.06;
         const e = { t: Math.max(0, t + jit(0.01)), dur: n.dur, midi: n.midi, kind: 'm', vel: clampVel(v + jit(0.04)) };
+        if (ens) {
+          e.inst = 'violin'; e.vel = clampVel(e.vel * 0.95);
+          if (ens === 'orch' && n.midi + 12 <= 96) { e.twin = { t: e.t + 0.004, dur: n.dur, midi: n.midi + 12, kind: 'm', inst: 'flute', vel: clampVel(e.vel * 0.5) }; events.push(e.twin); }
+        }
         events.push(e);
         if (n.tieStart) open.set(key, e);
       }
     }
   }
-  if (opts.chords && slots && slots.length) {
+  if (opts.chords && ens && slots && slots.length) {
+    orchestraParts(infoOut, slots, starts, total, shift, ens, jit, clampVel, events);
+  } else if (opts.chords && slots && slots.length) {
     const ss = [...slots].sort((a, b) => a.m - b.m || a.t - b.t);
     const chordAt = (q) => {
       let idx = -1;
@@ -1662,21 +1715,21 @@ function getNoise(ctx) {
   let seed = 7; for (let i = 0; i < n; i++) { seed = (seed * 16807) % 2147483647; d[i] = (seed / 2147483647) * 2 - 1; }
   return (noiseBuf = b);
 }
-function makeReverb(ctx) {
-  const len = Math.floor(ctx.sampleRate * 1.7), b = ctx.createBuffer(2, len, ctx.sampleRate);
+function makeReverb(ctx, hall) {
+  const len = Math.floor(ctx.sampleRate * (hall ? 2.8 : 1.7)), b = ctx.createBuffer(2, len, ctx.sampleRate);
   for (let c = 0; c < 2; c++) {
     const d = b.getChannelData(c); let seed = 99 + c * 31;
     for (let i = 0; i < len; i++) { seed = (seed * 16807) % 2147483647; const r = (seed / 2147483647) * 2 - 1; d[i] = r * Math.pow(1 - i / len, 2.6) * (i < 400 ? i / 400 : 1); }
   }
   const cv = ctx.createConvolver(); cv.buffer = b; return cv;
 }
-function buildBus(ctx) {
-  const master = ctx.createGain(); master.gain.value = 0.85;
+function buildBus(ctx, hall) {
+  const master = ctx.createGain(); master.gain.value = hall ? 2.0 : 0.85;
   const comp = ctx.createDynamicsCompressor();
   comp.threshold.value = -16; comp.ratio.value = 3.5; comp.attack.value = 0.006; comp.release.value = 0.2;
   const dry = ctx.createGain(); dry.gain.value = 0.86;
-  const wet = ctx.createGain(); wet.gain.value = 0.2;
-  const rv = makeReverb(ctx);
+  const wet = ctx.createGain(); wet.gain.value = hall ? 0.34 : 0.2;
+  const rv = makeReverb(ctx, hall);
   master.connect(dry); master.connect(rv); rv.connect(wet);
   dry.connect(comp); wet.connect(comp); comp.connect(ctx.destination);
   return master;
@@ -1761,7 +1814,106 @@ function leadNote(ctx, dest, f, when, dur, vel) {
   });
   lfo.start(when); lfo.stop(end + 0.5);
 }
+// ---- 오케스트라 악기 ----
+function panTo(ctx, bus, pan) {
+  if (!ctx.createStereoPanner) return bus;
+  bus._pans = bus._pans || {};
+  if (!bus._pans[pan]) { const p = ctx.createStereoPanner(); p.pan.value = pan; p.connect(bus); bus._pans[pan] = p; }
+  return bus._pans[pan];
+}
+function bowed(ctx, dest, f, when, dur, vel, o) {
+  // o: {n 겹 수, spread 센트, atk, rel, peak, cut 배수, vib 센트}
+  const end = when + Math.max(dur, 0.25), peak = o.peak * Math.pow(vel, 1.1);
+  const g = ctx.createGain(); g.connect(dest);
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.linearRampToValueAtTime(peak, when + o.atk);
+  g.gain.setTargetAtTime(peak * 0.82, when + o.atk, 0.4);
+  g.gain.cancelScheduledValues(end);
+  g.gain.setTargetAtTime(0.0001, end, o.rel);
+  const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 0.6;
+  lp.frequency.setValueAtTime(f * o.cut * 0.5, when);
+  lp.frequency.setTargetAtTime(Math.min(8000, f * o.cut), when, o.atk + 0.05);
+  lp.connect(g);
+  let lg = null;
+  if (o.vib) {
+    const lfo = ctx.createOscillator(); lfo.frequency.value = 5.2 + Math.random() * 0.6; lg = ctx.createGain();
+    lg.gain.setValueAtTime(0, when); lg.gain.linearRampToValueAtTime(o.vib, when + 0.45); lfo.connect(lg); lfo.start(when); lfo.stop(end + o.rel * 6 + 0.2);
+  }
+  for (let k = 0; k < o.n; k++) {
+    const os = ctx.createOscillator(), og = ctx.createGain();
+    os.type = 'sawtooth'; os.frequency.value = f; og.gain.value = 0.55 / Math.sqrt(o.n);
+    os.detune.value = o.n === 1 ? 0 : (k / (o.n - 1) - 0.5) * 2 * o.spread;
+    if (lg) lg.connect(os.detune);
+    os.connect(og); og.connect(lp); os.start(when); os.stop(end + o.rel * 6 + 0.2);
+  }
+}
+function fluteNote(ctx, dest, f, when, dur, vel) {
+  const end = when + Math.max(dur, 0.2), peak = 0.12 * Math.pow(vel, 1.1);
+  const g = ctx.createGain(); g.connect(dest);
+  g.gain.setValueAtTime(0.0001, when); g.gain.linearRampToValueAtTime(peak, when + 0.07);
+  g.gain.setTargetAtTime(peak * 0.85, when + 0.07, 0.3);
+  g.gain.cancelScheduledValues(end); g.gain.setTargetAtTime(0.0001, end, 0.08);
+  const lfo = ctx.createOscillator(), lg = ctx.createGain(); lfo.frequency.value = 5; lg.gain.setValueAtTime(0, when); lg.gain.linearRampToValueAtTime(5, when + 0.5);
+  lfo.connect(lg); lfo.start(when); lfo.stop(end + 0.6);
+  [[1, 1], [2, 0.16], [3, 0.05]].forEach(([m, a]) => {
+    const o = ctx.createOscillator(), og = ctx.createGain(); o.type = 'sine'; o.frequency.value = f * m; og.gain.value = a; lg.connect(o.detune);
+    o.connect(og); og.connect(g); o.start(when); o.stop(end + 0.6);
+  });
+  const nz = ctx.createBufferSource(); nz.buffer = getNoise(ctx); nz.loop = true;
+  const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = Math.min(6000, f * 2.5); bp.Q.value = 2;
+  const ng = ctx.createGain(); ng.gain.setValueAtTime(0.0001, when); ng.gain.linearRampToValueAtTime(peak * 0.22, when + 0.04); ng.gain.setTargetAtTime(peak * 0.08, when + 0.05, 0.1);
+  ng.gain.cancelScheduledValues(end); ng.gain.setTargetAtTime(0.0001, end, 0.06);
+  nz.connect(bp); bp.connect(ng); ng.connect(dest); nz.start(when); nz.stop(end + 0.5);
+}
+function hornNote(ctx, dest, f, when, dur, vel) {
+  const end = when + Math.max(dur, 0.3), peak = 0.1 * Math.pow(vel, 1.1);
+  const g = ctx.createGain(); g.connect(dest);
+  g.gain.setValueAtTime(0.0001, when); g.gain.linearRampToValueAtTime(peak, when + 0.16);
+  g.gain.setTargetAtTime(peak * 0.8, when + 0.16, 0.5);
+  g.gain.cancelScheduledValues(end); g.gain.setTargetAtTime(0.0001, end, 0.18);
+  const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 0.8;
+  lp.frequency.setValueAtTime(f * 1.4, when); lp.frequency.setTargetAtTime(Math.min(2400, f * 4.5), when, 0.18); lp.connect(g);
+  [['sawtooth', 0.4, 0], ['sawtooth', 0.4, 6], ['sine', 0.5, 0]].forEach(([t, a, c]) => {
+    const o = ctx.createOscillator(), og = ctx.createGain(); o.type = t; o.frequency.value = f; o.detune.value = c; og.gain.value = a;
+    o.connect(og); og.connect(lp); o.start(when); o.stop(end + 1);
+  });
+}
+function harpNote(ctx, dest, f, when, dur, vel) {
+  const end = when + Math.max(dur, 0.3), peak = 0.11 * Math.pow(vel, 1.2), reg = Math.max(0.5, Math.min(1.6, 2.2 - f / 500));
+  const g = ctx.createGain(); g.connect(dest);
+  g.gain.setValueAtTime(0.0001, when); g.gain.linearRampToValueAtTime(peak, when + 0.003);
+  g.gain.setTargetAtTime(0.0002, when + 0.003, 0.7 * reg);
+  for (let n = 1; n <= 5; n++) {
+    const o = ctx.createOscillator(), og = ctx.createGain(); o.type = 'sine'; o.frequency.value = f * n;
+    og.gain.setValueAtTime(0.9 / Math.pow(n, 1.1), when); og.gain.setTargetAtTime(0.02, when, 0.25 / n + 0.05);
+    o.connect(og); og.connect(g); o.start(when); o.stop(when + 3.2 * reg + 0.5);
+  }
+}
+function timpNote(ctx, dest, f, when, dur, vel) {
+  const g = ctx.createGain(); g.connect(dest);
+  g.gain.setValueAtTime(0.0001, when); g.gain.linearRampToValueAtTime(0.38 * vel, when + 0.006); g.gain.setTargetAtTime(0.0001, when + 0.02, 0.55);
+  const o = ctx.createOscillator(); o.type = 'sine'; o.frequency.setValueAtTime(f * 1.45, when); o.frequency.setTargetAtTime(f, when, 0.06);
+  o.connect(g); o.start(when); o.stop(when + 3);
+  const nz = ctx.createBufferSource(); nz.buffer = getNoise(ctx);
+  const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 180; bp.Q.value = 1;
+  const ng = ctx.createGain(); ng.gain.setValueAtTime(0.18 * vel, when); ng.gain.setTargetAtTime(0.0001, when, 0.02);
+  nz.connect(bp); bp.connect(ng); ng.connect(dest); nz.start(when); nz.stop(when + 0.1);
+}
+function ensembleEvent(ctx, bus, e, when, dur) {
+  const f = 440 * Math.pow(2, (e.midi - 69) / 12);
+  switch (e.inst) {
+    case 'violin': bowed(ctx, panTo(ctx, bus, -0.3), f, when, dur, e.vel, { n: 2, spread: 5, atk: 0.07, rel: 0.12, peak: 0.13, cut: 6, vib: 6 }); break;
+    case 'strings': bowed(ctx, panTo(ctx, bus, ((e.midi * 7) % 5 - 2) * 0.22), f, when, dur, e.vel, { n: 4, spread: 11, atk: 0.28, rel: 0.3, peak: 0.07, cut: 3.5, vib: 4 }); break;
+    case 'cello': bowed(ctx, panTo(ctx, bus, 0.3), f, when, dur, e.vel, { n: 2, spread: 4, atk: 0.1, rel: 0.2, peak: 0.16, cut: 4, vib: 3 }); break;
+    case 'flute': fluteNote(ctx, panTo(ctx, bus, 0.2), f, when, dur, e.vel); break;
+    case 'horn': hornNote(ctx, panTo(ctx, bus, 0.5), f, when, dur, e.vel); break;
+    case 'harp': harpNote(ctx, panTo(ctx, bus, -0.55), f, when, dur, e.vel); break;
+    case 'timp': timpNote(ctx, panTo(ctx, bus, 0), f, when, dur, e.vel); break;
+    default: break;
+  }
+}
 function playEvent(ctx, dest, e, when, dur) {
+  if (e.inst) { ensembleEvent(ctx, dest, e, when, dur); return; }
   const f = 440 * Math.pow(2, (e.midi - 69) / 12);
   const lead = $('#pl-lead').value === 'lead';
   if (e.kind === 'm') {
@@ -1797,11 +1949,11 @@ function startPlay() {
   stopPlay();
   const pb = CA.buildPlayback(CA.parseScore(S.outDoc), S.slots, S.shift, {
     melody: $('#pl-mel').checked, chords: $('#pl-chd').checked, style: $('#pl-style').value,
-    instrument: S.instrument, bpm: S.bpm, rit: $('#pl-rit').checked,
+    instrument: S.instrument, bpm: S.bpm, rit: $('#pl-rit').checked, ensemble: $('#pl-ens').value,
   });
   if (!pb.events.length) { say('들을 소리가 없습니다. 멜로디나 코드 반주를 켜 주세요.', true); return; }
   ac = new AC(); if (ac.state === 'suspended') ac.resume();
-  const bus = buildBus(ac);
+  const bus = buildBus(ac, $('#pl-ens').value !== 'solo');
   const tm = CA.makeTimeMap(pb.total, S.bpm, $('#pl-rit').checked);
   let stamps = [];
   try { if (osmd) { stamps = cursorStamps(); osmd.cursor.show(); } } catch (e) { stamps = []; }
@@ -1874,11 +2026,11 @@ function setShift(n, f1) {
 }
 /* 자체 점검용: 주소 끝에 #test 가 있을 때만 */
 if (location.hash === '#test') {
-  window.__render = async function (inst, style, lead) {
-    S.instrument = inst; syncControls(); $('#pl-style').value = style; $('#pl-lead').value = lead;
-    const pb = CA.buildPlayback(CA.parseScore(S.outDoc), S.slots, S.shift, { melody: true, chords: true, style, instrument: inst, bpm: S.bpm, rit: true });
+  window.__render = async function (inst, style, lead, ens) {
+    ens = ens || 'solo'; S.instrument = inst; syncControls(); $('#pl-style').value = style; $('#pl-lead').value = lead; $('#pl-ens').value = ens;
+    const pb = CA.buildPlayback(CA.parseScore(S.outDoc), S.slots, S.shift, { melody: true, chords: true, style, instrument: inst, bpm: S.bpm, rit: true, ensemble: ens });
     const tm = CA.makeTimeMap(pb.total, S.bpm, true), sr = 22050, secs = tm.sec(pb.total) + 3;
-    const oc = new OfflineAudioContext(2, Math.ceil(sr * secs), sr), bus = buildBus(oc);
+    const oc = new OfflineAudioContext(2, Math.ceil(sr * secs), sr), bus = buildBus(oc, ens !== 'solo');
     for (const e of pb.events) playEvent(oc, bus, e, 0.1 + tm.sec(e.t), Math.max(0.12, tm.sec(e.t + e.dur) - tm.sec(e.t)));
     const buf = await oc.startRendering(), d = buf.getChannelData(0);
     let peak = 0, sum = 0, clip = 0, nan = 0;
@@ -1901,8 +2053,9 @@ function wire() {
   $('#play').addEventListener('click', () => { if (ac) stopPlay(); else startPlay(); });
   $('#bpm').addEventListener('input', (e) => { S.bpm = +e.target.value; $('#bpmv').textContent = '♩=' + S.bpm; });
   $('#bpm').addEventListener('change', () => { if (ac) startPlay(); });
+  $('#pl-ens').addEventListener('change', () => { const e = $('#pl-ens').value !== 'solo'; $('#pl-style').hidden = e; $('#pl-lead').hidden = e; });
   $('#bpm').addEventListener('change', () => { if (ac) startPlay(); });
-  ['#pl-mel', '#pl-chd', '#pl-style', '#pl-lead', '#pl-rit'].forEach((id) => $(id).addEventListener('change', () => { if (ac) startPlay(); }));
+  ['#pl-mel', '#pl-chd', '#pl-ens', '#pl-style', '#pl-lead', '#pl-rit'].forEach((id) => $(id).addEventListener('change', () => { if (ac) startPlay(); }));
   $('#reset').addEventListener('click', () => { S.preferFlat = false; setShift(0, null); });
   $('#target').addEventListener('change', (e) => {
     const f = +e.target.value, minor = isMinor();
