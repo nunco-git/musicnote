@@ -191,8 +191,9 @@ pre.chart{margin:0;padding:10px 12px;border-radius:8px;background:var(--surface2
         <span class="lbl">코드 분석</span>
         <div class="row">
           <select id="split" aria-label="코드 간격">
+            <option value="auto" selected>자동 (곡에 맞춰)</option>
             <option value="bar">마디당 1개</option>
-            <option value="half" selected>반마디마다</option>
+            <option value="half">반마디마다</option>
             <option value="beat">박마다</option>
           </select>
           <select id="level" aria-label="코드 종류">
@@ -235,7 +236,9 @@ pre.chart{margin:0;padding:10px 12px;border-radius:8px;background:var(--surface2
       <label class="check">템포 <input type="range" id="bpm" min="40" max="200" step="1"> <span class="key-readout" id="bpmv"></span></label>
       <label class="check"><input type="checkbox" id="pl-mel" checked> 멜로디</label>
       <label class="check"><input type="checkbox" id="pl-chd" checked> 코드 반주</label>
-      <select id="pl-style" aria-label="반주 방식"><option value="strum">스트럼</option><option value="arp">아르페지오</option></select>
+      <select id="pl-style" aria-label="반주 방식"></select>
+      <select id="pl-lead" aria-label="멜로디 소리"><option value="inst">멜로디: 악기 소리</option><option value="lead">멜로디: 이어지는 소리</option></select>
+      <label class="check"><input type="checkbox" id="pl-rit" checked> 끝을 천천히</label>
       <div class="meter prog" id="prog" hidden><i style="width:0"></i></div>
     </div>
     <div class="paper"><div id="score"></div></div>
@@ -519,12 +522,14 @@ function resolveModes(measures, override) {
 /* ---------- 코드 추정 ---------- */
 function groupLen(ts) { return ts.type === 8 && ts.beats % 3 === 0 && ts.beats >= 6 ? 1.5 : 4 / ts.type; }
 
+// split: 'bar' | 'half' | 'beat' | 'auto'(박 단위로 쪼개 두고 화성 리듬을 스스로 고름)
 function segmentsFor(M, split) {
+  const mode = split === 'auto' ? 'beat' : split;
   const group = groupLen(M.ts);
   const nGroups = Math.max(1, Math.round(M.len / group));
   let starts = [0];
-  if (split === 'half' && nGroups >= 2) starts = [0, Math.ceil(nGroups / 2) * group];
-  else if (split === 'beat') { starts = []; for (let i = 0; i < nGroups; i++) starts.push(i * group); }
+  if (mode === 'half' && nGroups >= 2) starts = [0, Math.ceil(nGroups / 2) * group];
+  else if (mode === 'beat') { starts = []; for (let i = 0; i < nGroups; i++) starts.push(i * group); }
   const snapped = [];
   for (const s of starts) {
     let best = M.onsets[0];
@@ -533,6 +538,16 @@ function segmentsFor(M, split) {
   }
   snapped.sort((a, b) => a - b);
   return snapped.map((s, i) => ({ s, e: i + 1 < snapped.length ? snapped[i + 1] : Math.max(M.len, s + 0.25) }));
+}
+
+// 코드 바꾸기 비용: 마디 첫 박은 싸고, 한가운데 박은 중간, 나머지는 비쌈
+function changeCost(M, s, split) {
+  if (Math.abs(s) < EPS) return 0.05;
+  if (split === 'bar') return 0.05;
+  if (split === 'half') return 0.3;
+  const g = groupLen(M.ts), nb = Math.max(1, Math.round(M.len / g)), bi = s / g;
+  if (nb >= 4 && Math.abs(bi - Math.round(nb / 2)) < 1e-6) return 0.9;
+  return 2.2;
 }
 
 function segmentFeatures(M, seg, partSet, hasAccomp) {
@@ -561,34 +576,48 @@ function segmentFeatures(M, seg, partSet, hasAccomp) {
 
 const MAJOR_SCALE = [0, 2, 4, 5, 7, 9, 11];
 const MINOR_SCALE = [0, 2, 3, 5, 7, 8, 10, 11];
-const PRIOR_MAJ = { 0: 0.2, 7: 0.12, 5: 0.1, 9: 0.06, 2: 0.05, 4: 0.03 };
-const PRIOR_MIN = { 0: 0.2, 7: 0.12, 5: 0.1, 8: 0.06, 3: 0.05, 10: 0.03 };
+const PRIOR_MAJ = { 0: 0.3, 7: 0.12, 5: 0.1, 9: 0.06, 2: 0.05, 4: 0.03 };
+const PRIOR_MIN = { 0: 0.3, 7: 0.12, 5: 0.1, 8: 0.06, 3: 0.05, 10: 0.03 };
 const TR = { 0: 0, 5: 0.22, 7: 0.1, 9: 0.1, 2: 0.05, 8: 0.05, 3: 0, 10: 0, 4: -0.05, 6: -0.3, 1: -0.15, 11: -0.15 };
+// 기능 화성 전이 (으뜸음으로부터 근음 간격 '앞>뒤')
+const FUNC_MAJ = { '7>0': 0.55, '7>9': 0.35, '5>7': 0.4, '5>0': 0.3, '0>5': 0.3, '0>7': 0.25, '9>5': 0.3, '9>2': 0.3, '2>7': 0.5, '4>9': 0.3, '0>9': 0.25, '0>2': 0.15, '4>5': 0.25, '5>2': 0.1, '0>4': 0.05, '9>7': 0.1, '11>0': 0.4, '2>0': -0.05, '7>5': -0.3, '7>4': -0.1, '9>0': -0.05, '4>2': 0.1, '5>9': 0 };
+const FUNC_MIN = { '7>0': 0.55, '5>7': 0.4, '0>5': 0.3, '8>3': 0.3, '3>8': 0.3, '8>5': 0.3, '5>0': 0.3, '0>10': 0.25, '10>3': 0.3, '10>0': 0.15, '2>7': 0.5, '3>5': 0.25, '8>10': 0.3, '0>7': 0.25, '7>8': 0.3, '8>7': 0.15, '7>5': -0.3, '10>8': 0.2, '0>8': 0.2, '0>3': 0.15 };
 
 function emission(c, F, ctx) {
   if (F.tot < EPS) return 0;
   const pcs = QUAL[c.q].pcs.map((x) => mod(x + c.root, 12));
   let cover = 0;
   for (const pc of pcs) cover += F.w[pc] / F.tot;
-  let sc = cover * 2.2 - (1 - cover) * 1.3;
-  sc += 0.3 * (F.w[c.root] / F.tot);
-  if (F.anchor != null) sc += pcs.includes(F.anchor) ? 0.3 : -0.1;
-  for (const pc of pcs) if (!ctx.scale.has(pc) && F.w[pc] / F.tot < 0.15) sc -= 0.3;
-  if (pcs.length >= 4) sc -= 0.12 + (F.w[pcs[3]] / F.tot >= 0.12 ? 0 : 0.3);
-  if (c.q === '7' && mod(c.root - ctx.tonic, 12) === 7) sc += 0.1;
+  let sc = cover * 2.4 - (1 - cover) * 1.5;
+  sc += 0.15 * (F.w[c.root] / F.tot);
+  if (F.anchor != null) sc += pcs.includes(F.anchor) ? 0.3 : -0.4;
+  // 회피음: 코드음 바로 반음 위에서 오래 머무는 멜로디음은 부딪힌다
+  for (let pc = 0; pc < 12; pc++) {
+    const share = F.w[pc] / F.tot;
+    if (share < 0.18 || pcs.includes(pc)) continue;
+    if (pcs.includes(mod(pc - 1, 12))) sc -= 0.5 * share;
+  }
+  for (const pc of pcs) if (!ctx.scale.has(pc) && F.w[pc] / F.tot < 0.15) sc -= c.q === '7' ? 0.2 : 0.35;
+  if (c.q === 'dim') sc -= 0.2;
+  if (c.q === 'm7b5') sc -= 0.1;
+  if (pcs.length >= 4) sc -= 0.15 + (F.w[pcs[3]] / F.tot >= 0.12 ? 0 : 0.3);
   const rel = mod(c.root - ctx.tonic, 12);
   sc += (ctx.minor ? PRIOR_MIN : PRIOR_MAJ)[rel] || 0;
   if (F.bassPc != null) sc += c.root === F.bassPc ? 0.35 : pcs.includes(F.bassPc) ? 0.1 : -0.2;
   return sc;
 }
-function transScore(a, b) {
-  if (a.root === b.root && a.q === b.q) return 0.15;
-  return TR[mod(b.root - a.root, 12)];
+function transScore(a, b, ctx, chg) {
+  if (a.root === b.root && a.q === b.q) return 0.1;
+  const ra = mod(a.root - ctx.tonic, 12), rb = mod(b.root - ctx.tonic, 12);
+  let v = (ctx.minor ? FUNC_MIN : FUNC_MAJ)[ra + '>' + rb];
+  if (v == null) v = TR[mod(b.root - a.root, 12)] * 0.6;
+  if (a.q === '7' && mod(b.root - a.root, 12) === 5) v += 0.45;
+  return v - chg;
 }
 
 function analyze(info, opts) {
   opts = opts || {};
-  const split = opts.split || 'half';
+  const split = opts.split || 'auto';
   const set = opts.level === 'seventh' ? SEVENTH_SET : TRIAD_SET;
   const partSet = opts.parts && opts.parts.size ? opts.parts : null;
   const cands = [];
@@ -602,13 +631,13 @@ function analyze(info, opts) {
       scale: new Set((minor ? MINOR_SCALE : MAJOR_SCALE).map((x) => mod(x + tonicPcOf(M.key.fifths, minor), 12))),
     };
     for (const sg of segmentsFor(M, split)) {
-      segs.push({ m: M.i, t: sg.s, ctx, F: segmentFeatures(M, sg, partSet, info.hasAccomp) });
+      segs.push({ m: M.i, t: sg.s, wt: split === 'auto' ? Math.max(0.35, Math.min(1, (sg.e - sg.s) / (2 * groupLen(M.ts)))) : 1, ctx, chg: changeCost(M, sg.s, split), F: segmentFeatures(M, sg, partSet, info.hasAccomp) });
     }
   }
   if (!segs.length) return [];
   const N = segs.length, K = cands.length;
   const em = segs.map((sg, i) => cands.map((c) => {
-    let v = emission(c, sg.F, sg.ctx);
+    let v = emission(c, sg.F, sg.ctx) * sg.wt;
     const tonicQ = sg.ctx.minor ? 'm' : '';
     if (i === 0 && c.root === sg.ctx.tonic && c.q === tonicQ) v += 0.3;
     if (i === N - 1 && c.root === sg.ctx.tonic && c.q === tonicQ) v += 0.5;
@@ -621,7 +650,7 @@ function analyze(info, opts) {
     for (let k = 0; k < K; k++) {
       let best = -1e9, arg = 0;
       for (let j = 0; j < K; j++) {
-        const v = dp[i - 1][j] + transScore(cands[j], cands[k]);
+        const v = dp[i - 1][j] + transScore(cands[j], cands[k], segs[i].ctx, segs[i].chg);
         if (v > best) { best = v; arg = j; }
       }
       dp[i][k] = best + em[i][k];
@@ -632,13 +661,17 @@ function analyze(info, opts) {
   for (let j = 1; j < K; j++) if (dp[N - 1][j] > dp[N - 1][k]) k = j;
   const path = new Array(N);
   for (let i = N - 1; i >= 0; i--) { path[i] = k; k = bp[i][k]; }
-  return segs.map((sg, i) => {
+  const out = [];
+  segs.forEach((sg, i) => {
     const c = cands[path[i]];
+    const prev = out[out.length - 1];
+    if (prev && prev.m === sg.m && prev.root === c.root && prev.q === c.q) return; // 같은 마디 안 반복 코드는 생략
     const alts = cands.map((x, idx) => ({ root: x.root, q: x.q, s: em[i][idx] }))
       .filter((x) => !(x.root === c.root && x.q === c.q)).sort((a, b) => b.s - a.s).slice(0, 5)
       .map(({ root, q }) => ({ root, q }));
-    return { m: sg.m, t: sg.t, root: c.root, q: c.q, bass: null, alts };
+    out.push({ m: sg.m, t: sg.t, root: c.root, q: c.q, bass: null, alts });
   });
+  return out;
 }
 
 function slotsFromExisting(info) {
@@ -881,17 +914,109 @@ function rate(slots, total, instrument) {
 }
 
 /* ---------- 연주(소리) 이벤트 ---------- */
+function rng(seed) { let a = seed >>> 0; return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+
+// 화음 음높이를 앞 화음에서 가장 적게 움직이도록 배치 (보이스 리딩)
+function chordVoicing(pcs, prev, lo, hi) {
+  const n = pcs.length;
+  let best = null, bestCost = 1e9;
+  for (let r = 0; r < n; r++) {
+    for (let oct = 0; oct < 3; oct++) {
+      let cur = lo + oct * 12 - 12;
+      while (mod(cur, 12) !== mod(pcs[r], 12)) cur++;
+      const notes = [cur];
+      for (let k = 1; k < n; k++) { let m = notes[k - 1] + 1; while (mod(m, 12) !== mod(pcs[(r + k) % n], 12)) m++; notes.push(m); }
+      if (notes[0] < lo || notes[n - 1] > hi) continue;
+      let cost;
+      if (prev && prev.length) {
+        cost = 0;
+        for (let k = 0; k < Math.max(n, prev.length); k++) cost += Math.abs((notes[Math.min(k, n - 1)]) - prev[Math.min(k, prev.length - 1)]);
+      } else cost = Math.abs((notes[0] + notes[n - 1]) / 2 - (lo + hi) / 2) * n;
+      cost += (notes[n - 1] - notes[0]) * 0.1;
+      if (cost < bestCost) { bestCost = cost; best = notes; }
+    }
+  }
+  if (!best) { best = pcs.map((p) => { let m = lo; while (mod(m, 12) !== mod(p, 12)) m++; return m; }).sort((a, b) => a - b); }
+  return best;
+}
+
+// 박자별 반주 패턴. 위치(x)는 마디 안 4분음표 단위.
+function bassNote(kind, i) { return { kind, i }; }
+function patternFor(ts, instrument, style) {
+  const g = groupLen(ts), nb = Math.max(1, Math.round((ts.beats * 4 / ts.type) / g));
+  const eighths = (n) => Array.from({ length: n }, (_, k) => k * 0.5);
+  const full = ts.beats * 4 / ts.type;
+  if (instrument === 'guitar') {
+    if (style === 'arp') {
+      const L = Math.round(full / 0.5);
+      let pat;
+      if (L === 8) pat = ['b1', 'h0', 'h1', 'h2', 'b2', 'h0', 'h1', 'h2'];
+      else if (L === 6) pat = ['b1', 'h0', 'h1', 'b2', 'h1', 'h0'];
+      else if (L === 4) pat = ['b1', 'h0', 'h1', 'h0'];
+      else pat = eighths(L).map((_, k) => (k % 4 === 0 ? 'b1' : k % 4 === 2 ? 'b2' : 'h' + (k % 3)));
+      return eighths(L).map((x, k) => ({ x, op: pat[k], v: k === 0 ? 1 : x % 1 === 0 ? 0.8 : 0.6 }));
+    }
+    if (g === 1.5) return Array.from({ length: nb }, (_, k) => [{ x: k * 1.5, op: 'B' + (k % 2), v: k === 0 ? 1 : 0.85 }, { x: k * 1.5 + 0.5, op: 'D', v: 0.6 }, { x: k * 1.5 + 1, op: 'U', v: 0.45 }]).flat();
+    if (full === 4) return [{ x: 0, op: 'B0', v: 1 }, { x: 1, op: 'D', v: 0.7 }, { x: 1.5, op: 'U', v: 0.45 }, { x: 2, op: 'B1', v: 0.85 }, { x: 3, op: 'D', v: 0.7 }, { x: 3.5, op: 'U', v: 0.45 }];
+    if (full === 3) return [{ x: 0, op: 'B0', v: 1 }, { x: 1, op: 'D', v: 0.7 }, { x: 2, op: 'D', v: 0.6 }];
+    if (full === 2) return [{ x: 0, op: 'B0', v: 1 }, { x: 1, op: 'D', v: 0.7 }, { x: 1.5, op: 'U', v: 0.45 }];
+    return Array.from({ length: Math.max(1, Math.round(full / g)) }, (_, k) => ({ x: k * g, op: k % 2 ? 'D' : 'B0', v: k ? 0.7 : 1 }));
+  }
+  // 피아노
+  if (style === 'arp') {
+    const L = Math.round(full / 0.5), seq = [0, 1, 2, 1];
+    const out = [];
+    for (let k = 0; k < L; k++) {
+      const x = k * 0.5;
+      if (Math.abs(x / g - Math.round(x / g)) < 1e-6) out.push({ x, op: 'LB' + (Math.round(x / g) % 2), v: x === 0 ? 1 : 0.8 });
+      else out.push({ x, op: 'R' + seq[k % 4], v: x % 1 === 0 ? 0.6 : 0.5 });
+    }
+    return out;
+  }
+  if (g === 1.5) return Array.from({ length: nb }, (_, k) => [{ x: k * 1.5, op: 'LB' + (k % 2), v: k === 0 ? 1 : 0.8 }, { x: k * 1.5 + 0.5, op: 'RC', v: 0.55 }, { x: k * 1.5 + 1, op: 'RC', v: 0.5 }]).flat();
+  if (full === 4) return [{ x: 0, op: 'LB0', v: 1 }, { x: 0, op: 'RC', v: 0.8 }, { x: 1, op: 'RC', v: 0.5 }, { x: 2, op: 'LB1', v: 0.8 }, { x: 2, op: 'RC', v: 0.65 }, { x: 3, op: 'RC', v: 0.5 }];
+  if (full === 3) return [{ x: 0, op: 'LB0', v: 1 }, { x: 0, op: 'RC', v: 0.8 }, { x: 1, op: 'RC', v: 0.55 }, { x: 2, op: 'RC', v: 0.5 }];
+  if (full === 2) return [{ x: 0, op: 'LB0', v: 1 }, { x: 0, op: 'RC', v: 0.8 }, { x: 1, op: 'RC', v: 0.55 }];
+  return Array.from({ length: Math.max(1, Math.round(full / g)) }, (_, k) => ({ x: k * g, op: k ? 'RC' : 'LB0', v: k ? 0.55 : 1 }));
+}
+
+// 쉬어가는(리타르단도) 시간 지도: 퀘터노트 위치 <-> 초
+function makeTimeMap(total, bpm, rit) {
+  const spq = 60 / bpm;
+  const span = Math.min(6, total / 2), start = total - span, k = 1 / 0.78 - 1;
+  const sec = (q) => {
+    if (!rit || q <= start) return q * spq;
+    const x = Math.min(q, total + 8) - start;
+    return spq * (start + x + (k * x * x) / (2 * span));
+  };
+  const qAt = (s) => {
+    if (!rit || s <= start * spq) return s / spq;
+    const y = s / spq - start; // x + k x²/(2 span) = y
+    const a = k / (2 * span);
+    return start + (-1 + Math.sqrt(1 + 4 * a * y)) / (2 * a);
+  };
+  return { sec, qAt, span, start };
+}
+
 // infoOut: 조옮김이 반영된 악보를 parseScore한 결과. 시간 단위는 4분음표.
 function buildPlayback(infoOut, slots, shift, opts) {
   opts = opts || {};
+  const instrument = opts.instrument || 'guitar';
+  const rand = rng(12345);
+  const human = opts.human !== false;
+  const jit = (amt) => (human ? (rand() - 0.5) * 2 * amt : 0);
   const starts = [];
   let acc = 0;
   for (const M of infoOut.measures) { starts.push(acc); acc += M.len; }
   const total = acc;
   const events = [];
+  const clampVel = (v) => Math.max(0.15, Math.min(1.2, v));
   if (opts.melody) {
     const open = new Map();
     for (const M of infoOut.measures) {
+      const g = groupLen(M.ts);
+      const fullLen = M.ts.beats * 4 / M.ts.type;
+      const pick = M.i === 0 && M.len < fullLen - 1e-6 ? fullLen - M.len : 0;
       for (const n of M.notes) {
         if (n.rest || n.midi == null || n.grace) continue;
         const t = starts[M.i] + n.t;
@@ -902,45 +1027,96 @@ function buildPlayback(infoOut, slots, shift, opts) {
           if (!n.tieStart) open.delete(key);
           continue;
         }
-        const e = { t, dur: n.dur, midi: n.midi, kind: 'm', vel: 1 };
+        const pos = n.t + pick;
+        let v = Math.abs(pos) < 1e-6 ? 1.0 : Math.abs(mod(pos + 1e-6, g) - 1e-6) < 2e-6 ? 0.88 : pos % 1 === 0 ? 0.8 : 0.7;
+        if (n.dur >= 2) v += 0.06;
+        const e = { t: Math.max(0, t + jit(0.01)), dur: n.dur, midi: n.midi, kind: 'm', vel: clampVel(v + jit(0.04)) };
         events.push(e);
         if (n.tieStart) open.set(key, e);
       }
     }
   }
-  if (opts.chords) {
+  if (opts.chords && slots && slots.length) {
     const ss = [...slots].sort((a, b) => a.m - b.m || a.t - b.t);
-    ss.forEach((sl, i) => {
-      const t = starts[sl.m] + sl.t;
-      const nx = ss[i + 1];
-      const end = nx ? starts[nx.m] + nx.t : total;
-      const dur = Math.max(0.25, end - t);
-      const root = mod(sl.root + shift, 12);
-      const bass = sl.bass != null ? mod(sl.bass + shift, 12) : root;
-      const base = 48 + root;
-      const tones = QUAL[sl.q].pcs.map((x) => base + x);
-      const g = groupLen(infoOut.measures[sl.m].ts);
-      const bassMidi = 36 + bass;
-      const put = (tt, d, midi, kind, vel) => { if (tt < t + dur - 1e-6) events.push({ t: tt, dur: Math.min(d, t + dur - tt), midi, kind, vel }); };
-      if (opts.style === 'arp') {
-        const pat = tones.length >= 4 ? [0, 1, 2, 3, 2, 1, 2, 1] : [0, 1, 2, 1, 2, 1, 2, 1];
-        let k = 0;
-        for (let x = 0; x < dur - 1e-6; x += 0.5) {
-          if (Math.abs(x / g - Math.round(x / g)) < 1e-6) put(t + x, g * 1.8, bassMidi, 'b', 1);
-          put(t + x, 1.4, tones[pat[k % pat.length]], 'c', 0.75);
-          k++;
+    const chordAt = (q) => {
+      let idx = -1;
+      for (let i = 0; i < ss.length; i++) { if (starts[ss[i].m] + ss[i].t <= q + 1e-6) idx = i; else break; }
+      if (idx < 0) idx = 0;
+      const sl = ss[idx], nx = ss[idx + 1];
+      return { sl, idx, end: nx ? starts[nx.m] + nx.t : total };
+    };
+    const info = (sl) => {
+      if (sl._pb && sl._pb.shift === shift) return sl._pb;
+      const root = mod(sl.root + shift, 12), bass = sl.bass != null ? mod(sl.bass + shift, 12) : root;
+      const pcs = QUAL[sl.q].pcs.map((x) => mod(x + root, 12));
+      const fifth = mod(root + (QUAL[sl.q].pcs.find((x) => x === 7 || x === 6 || x === 8) || 7), 12);
+      const sh = instrument === 'guitar' ? guitarShape(root, sl.q) : null;
+      let strings = null;
+      if (sh) strings = sh.frets.map((f, i) => (f < 0 ? null : 36 + OPEN_STRINGS[i] + f)).filter((x) => x != null);
+      return (sl._pb = { shift, root, bass, pcs, fifth, strings });
+    };
+    let prevVoicing = null, lastIdx = -1, voicing = null;
+    const bassLow = (pc, lo) => { let m = lo; while (mod(m, 12) !== pc) m++; return m; };
+    const stag = 0.016 * (opts.bpm || 100) / 60;
+    for (const M of infoOut.measures) {
+      const full = M.ts.beats * 4 / M.ts.type;
+      const pick = M.i === 0 && M.len < full - 1e-6 ? full - M.len : 0;
+      const pat = patternFor(M.ts, instrument, opts.style).filter((p) => p.x - pick >= -1e-6 && p.x - pick < M.len - 1e-6);
+      for (let pi = 0; pi < pat.length; pi++) {
+        const p = pat[pi];
+        const t = starts[M.i] + p.x - pick;
+        const { sl, idx, end } = chordAt(t);
+        const I = info(sl);
+        if (idx !== lastIdx) {
+          lastIdx = idx;
+          if (instrument === 'piano') voicing = prevVoicing = chordVoicing(I.pcs, prevVoicing, 55, 72);
         }
-      } else {
-        let b = 0;
-        for (let x = 0; x < dur - 1e-6; x += g, b++) {
-          if (b % 2 === 0) put(t + x, g * 2, bassMidi, 'b', 1);
-          tones.forEach((m, i) => put(t + x + i * 0.035, g * 1.6, m, 'c', x === 0 ? 1 : 0.7));
+        // 다음 패턴 위치까지(또는 코드 끝까지)가 이 소리의 길이
+        const nextX = pat.slice(pi + 1).find((q) => q.x > p.x + 1e-6);
+        const nextT = nextX ? starts[M.i] + nextX.x - pick : starts[M.i] + M.len;
+        const ring = Math.max(0.3, Math.min(end, nextT + (opts.style === 'arp' ? 1.5 : 0.6)) - t);
+        const put = (tt, d, midi, kind, vel) => events.push({ t: Math.max(0, tt + jit(0.012)), dur: d, midi, kind, vel: clampVel(vel + jit(0.04)) });
+        const op = p.op;
+        if (instrument === 'guitar') {
+          const st = I.strings || I.pcs.map((pc) => bassLow(pc, 48));
+          const lowRoot = st.find((m) => mod(m, 12) === I.bass) || bassLow(I.bass, 40);
+          const altBass = (st.length > 2 && st.find((m, ii) => ii > st.indexOf(lowRoot) && mod(m, 12) === I.fifth)) || st[Math.min(1, st.length - 1)];
+          if (op === 'B0') { put(t, ring, lowRoot, 'b', p.v); }
+          else if (op === 'B1') { put(t, ring, altBass, 'b', p.v); }
+          else if (op === 'D' || op === 'U') {
+            const hi = st.slice(Math.min(2, st.length - 1));
+            const order = op === 'D' ? hi : [...hi].reverse().slice(0, 4);
+            order.forEach((m, k) => put(t + k * stag, Math.min(ring, 1.4), m, 'c', p.v * (op === 'U' ? 0.75 : 1 - k * 0.04)));
+          } else if (op[0] === 'b') put(t, ring + 0.5, op === 'b1' ? lowRoot : altBass, 'b', p.v);
+          else if (op[0] === 'h') { const hi = st.filter((m) => m !== lowRoot && m !== altBass); const top = hi.slice(-3); put(t, ring + 0.5, top[+op[1] % top.length] || st[st.length - 1], 'c', p.v); }
+        } else {
+          const root = bassLow(I.bass, 36), fifth = bassLow(I.fifth, 36);
+          if (op === 'LB0') { put(t, ring + 0.5, root, 'b', p.v); put(t, ring + 0.5, root + 12 <= 52 ? root + 12 : root, 'b', p.v * 0.5); }
+          else if (op === 'LB1') put(t, ring, fifth > root + 8 ? fifth : fifth + 12, 'b', p.v);
+          else if (op === 'RC') voicing.forEach((m, k) => put(t + k * 0.01, Math.min(ring, 1.8), m, 'c', p.v * (1 - k * 0.03)));
+          else if (op[0] === 'R') { const v = voicing[+op[1] % voicing.length]; put(t, 1.6, v + (+op[1] === 0 ? 0 : 0), 'c', p.v); }
         }
       }
-    });
+    }
+  }
+  if (opts.rit && total > 2) {
+    // 마지막 소리들은 쉬었다 닫도록 약간 늘린다
+    for (const e of events) if (e.t + e.dur > total - 1e-6 && e.t + e.dur < total + 2) e.dur += 1.5;
   }
   events.sort((a, b) => a.t - b.t);
   return { events, total, starts };
+}
+
+/* ---------- 로마 숫자 (조 안에서 이 코드의 역할) ---------- */
+function romanFor(root, q, tonicPc, minor) {
+  const rel = mod(root - tonicPc, 12);
+  const MAJ = ['I', '♭II', 'II', '♭III', 'III', 'IV', '♭V', 'V', '♭VI', 'VI', '♭VII', 'VII'];
+  const MIN = ['I', '♭II', 'II', 'III', '♯III', 'IV', '♭V', 'V', 'VI', '♯VI', 'VII', '♯VII'];
+  let r = (minor ? MIN : MAJ)[rel];
+  const lower = q === 'm' || q === 'm7' || q === 'dim' || q === 'm7b5';
+  if (lower) r = r.replace(/[IV]+/, (x) => x.toLowerCase());
+  const suf = { '': '', m: '', '7': '7', maj7: 'maj7', m7: '7', dim: '°', m7b5: 'ø7' }[q];
+  return r + (suf == null ? '' : suf);
 }
 
 /* ---------- 예시 악보 (환희의 송가, 공개 도메인) ---------- */
@@ -964,7 +1140,7 @@ function sampleXml() {
 root.CA = {
   QUAL, QUAL_ORDER, LOF, mod, nameForPc, pretty, keyName, keyNameShort, tonicPcOf, fifthsFromTonic, shapeFifths, chordName, mapKey,
   parseScore, analyze, slotsFromExisting, buildOutput, displayChord, chartText, guitarShape, shapePcs, pianoKeys, BLACK, rate,
-  buildPlayback, sampleXml, OPEN, E_SHAPE, A_SHAPE, OPEN_STRINGS,
+  buildPlayback, makeTimeMap, chordVoicing, romanFor, sampleXml, OPEN, E_SHAPE, A_SHAPE, OPEN_STRINGS,
 };
 if (typeof module !== 'undefined' && module.exports) module.exports = root.CA;
 })(typeof window !== 'undefined' ? window : globalThis);
@@ -982,7 +1158,7 @@ const S = {
   srcDoc: null, info: null, slots: [], sel: null, fname: '',
   shift: 0, targetF1: null, preferFlat: false,
   capo: 0, capoView: false, instrument: 'guitar',
-  split: 'half', level: 'triad', part: 'all', mode: null,
+  split: 'auto', level: 'triad', part: 'all', mode: null,
   dirty: false, pending: false, fifthsAt: [], lastXml: '', outDoc: null, bpm: 100, zoom: 1, tab: 'edit',
 };
 let ac = null, raf = 0, playSt = null, osmd = null, seq = 0, downloads = null, confirmTimer = 0, msgTimer = 0;
@@ -1122,6 +1298,11 @@ function syncControls() {
   $('#inst-guitar').setAttribute('aria-pressed', String(S.instrument === 'guitar'));
   $('#inst-piano').setAttribute('aria-pressed', String(S.instrument === 'piano'));
   $('#capo-grp').hidden = S.instrument !== 'guitar';
+  const ps = $('#pl-style'), opts = S.instrument === 'guitar' ? [['strum', '스트럼'], ['arp', '핑거피킹']] : [['strum', '블록 코드'], ['arp', '아르페지오']];
+  if (ps.dataset.inst !== S.instrument) {
+    ps.textContent = ''; opts.forEach(([v, t]) => { const o = document.createElement('option'); o.value = v; o.textContent = t; ps.append(o); });
+    ps.dataset.inst = S.instrument; $('#pl-lead').value = S.instrument === 'guitar' ? 'lead' : 'inst';
+  }
 }
 function renderKeyControls() {
   const f1 = curF1();
@@ -1187,7 +1368,11 @@ function renderEditor() {
   const where = document.createElement('span'); where.className = 'note';
   const M = S.info.measures[s.m];
   where.textContent = `${M.num}마디 · ${Math.round((s.t * 100)) / 100 === 0 ? '첫 박' : (Math.round(s.t * 100) / 100 + 1) + '번째 위치'}`;
-  head.append(big, where);
+  let rn = '';
+  try { const km = S.info.measures[s.m].key; rn = CA.romanFor(s.root, s.q, CA.tonicPcOf(km.fifths, isMinor()), isMinor()); } catch (e) { rn = ''; }
+  head.append(big);
+  if (rn) { const r = document.createElement('span'); r.className = 'note'; r.textContent = rn; r.title = '이 조에서의 역할(로마 숫자)'; head.append(r); }
+  head.append(where);
   if (capoOn()) { const c = document.createElement('span'); c.className = 'note'; c.textContent = `카포 기준 모양: ${dcView(s).name}`; head.append(c); }
 
   const roots = document.createElement('div'); roots.className = 'roots';
@@ -1470,29 +1655,121 @@ async function savePng() {
 }
 
 /* ---------- 소리로 듣기 ---------- */
-function voice(ctx, dest, freq, when, dur, vel, kind) {
-  const guitar = S.instrument === 'guitar';
-  const g = ctx.createGain();
-  const peak = (kind === 'm' ? 0.2 : kind === 'b' ? 0.2 : 0.075) * vel;
-  const end = when + dur;
-  g.gain.setValueAtTime(0.0001, when);
-  g.gain.linearRampToValueAtTime(peak, when + (kind === 'm' ? 0.015 : 0.006));
-  if (kind === 'm') { g.gain.exponentialRampToValueAtTime(peak * 0.55, when + Math.min(dur, 0.6)); }
-  else { g.gain.exponentialRampToValueAtTime(peak * 0.22, when + Math.min(dur, 1.6)); }
-  g.gain.setValueAtTime(g.gain.value || peak * 0.3, end);
-  g.gain.exponentialRampToValueAtTime(0.0001, end + 0.14);
-  let out = g;
-  if (kind !== 'm' && guitar) {
-    const f = ctx.createBiquadFilter(); f.type = 'lowpass';
-    f.frequency.setValueAtTime(Math.min(6000, freq * 7 + 600), when);
-    f.frequency.exponentialRampToValueAtTime(Math.max(350, freq * 1.8), when + 0.7);
-    f.connect(g); out = f;
+let noiseBuf = null, irBuf = null;
+function getNoise(ctx) {
+  if (noiseBuf && noiseBuf.sampleRate === ctx.sampleRate) return noiseBuf;
+  const n = Math.floor(ctx.sampleRate * 0.12), b = ctx.createBuffer(1, n, ctx.sampleRate), d = b.getChannelData(0);
+  let seed = 7; for (let i = 0; i < n; i++) { seed = (seed * 16807) % 2147483647; d[i] = (seed / 2147483647) * 2 - 1; }
+  return (noiseBuf = b);
+}
+function makeReverb(ctx) {
+  const len = Math.floor(ctx.sampleRate * 1.7), b = ctx.createBuffer(2, len, ctx.sampleRate);
+  for (let c = 0; c < 2; c++) {
+    const d = b.getChannelData(c); let seed = 99 + c * 31;
+    for (let i = 0; i < len; i++) { seed = (seed * 16807) % 2147483647; const r = (seed / 2147483647) * 2 - 1; d[i] = r * Math.pow(1 - i / len, 2.6) * (i < 400 ? i / 400 : 1); }
   }
-  const o1 = ctx.createOscillator(), o2 = ctx.createOscillator(), g2 = ctx.createGain();
-  o1.type = kind !== 'm' && guitar ? 'sawtooth' : 'triangle'; o2.type = 'sine';
-  o1.frequency.value = freq; o2.frequency.value = freq * 2; g2.gain.value = kind === 'm' ? 0.18 : 0.3;
-  o1.connect(out); o2.connect(g2); g2.connect(out); g.connect(dest);
-  o1.start(when); o2.start(when); o1.stop(end + 0.2); o2.stop(end + 0.2);
+  const cv = ctx.createConvolver(); cv.buffer = b; return cv;
+}
+function buildBus(ctx) {
+  const master = ctx.createGain(); master.gain.value = 0.85;
+  const comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 3.5; comp.attack.value = 0.006; comp.release.value = 0.2;
+  const dry = ctx.createGain(); dry.gain.value = 0.86;
+  const wet = ctx.createGain(); wet.gain.value = 0.2;
+  const rv = makeReverb(ctx);
+  master.connect(dry); master.connect(rv); rv.connect(wet);
+  dry.connect(comp); wet.connect(comp); comp.connect(ctx.destination);
+  return master;
+}
+function noteGain(ctx, dest, when, peak, atk, decayTau, end, rel) {
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.linearRampToValueAtTime(peak, when + atk);
+  g.gain.setTargetAtTime(peak * 0.0001 + 0.0002, when + atk, decayTau);
+  g.gain.cancelScheduledValues(end);
+  g.gain.setTargetAtTime(0.0001, end, rel);
+  g.connect(dest); return g;
+}
+// 피아노: 부분음마다 다르게 줄어들고(고음일수록 빨리), 해머 소리를 더함
+function pianoNote(ctx, dest, f, when, dur, vel, isMelody) {
+  const midi = 69 + 12 * Math.log2(f / 440);
+  const reg = Math.max(0.35, Math.min(1.5, 1.5 - (midi - 36) / 60));
+  const tau = (0.9 + 1.6 * reg) * (isMelody ? 1.1 : 0.9);
+  const end = when + Math.max(dur, 0.2), peak = (isMelody ? 0.22 : 0.1) * Math.pow(vel, 1.3);
+  const g = ctx.createGain(); g.connect(dest);
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.linearRampToValueAtTime(peak, when + 0.004);
+  g.gain.setTargetAtTime(peak * 0.35, when + 0.004, 0.25);
+  g.gain.setTargetAtTime(peak * 0.0003, when + 0.3, tau);
+  g.gain.cancelScheduledValues(end);
+  g.gain.setTargetAtTime(0.0001, end, isMelody ? 0.16 : 0.12);
+  const bright = 0.45 + 0.55 * vel, B = 0.00035;
+  for (let n = 1; n <= 7; n++) {
+    const fn = f * n * Math.sqrt(1 + B * n * n);
+    if (fn > 9000) break;
+    const o = ctx.createOscillator(), pg = ctx.createGain();
+    o.type = 'sine'; o.frequency.value = fn;
+    const amp = Math.pow(bright, n - 1) / Math.pow(n, 0.85);
+    pg.gain.setValueAtTime(amp, when); pg.gain.setTargetAtTime(amp * 0.04, when, 0.5 / Math.pow(n, 0.7) * (0.6 + reg));
+    o.connect(pg); pg.connect(g); o.start(when); o.stop(end + 0.9);
+    if (n === 1) { const o2 = ctx.createOscillator(), p2 = ctx.createGain(); o2.type = 'sine'; o2.frequency.value = fn * 1.0016; p2.gain.value = 0.5; o2.connect(p2); p2.connect(g); o2.start(when); o2.stop(end + 0.9); }
+  }
+  const nz = ctx.createBufferSource(); nz.buffer = getNoise(ctx);
+  const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = Math.min(3500, f * 5); bp.Q.value = 0.8;
+  const ng = ctx.createGain(); ng.gain.setValueAtTime(peak * 0.7 * vel, when); ng.gain.setTargetAtTime(0.0001, when, 0.012);
+  nz.connect(bp); bp.connect(ng); ng.connect(dest); nz.start(when); nz.stop(when + 0.1);
+}
+// 기타: 튕김(톱니파+저역통과가 닫힘) + 살짝 어긋난 두 음 + 피크 소리
+function guitarNote(ctx, dest, f, when, dur, vel, isBass) {
+  const end = when + Math.max(dur, 0.25), peak = (isBass ? 0.17 : 0.09) * Math.pow(vel, 1.2);
+  const tau = isBass ? 1.5 : 1.0 + Math.min(0.8, 220 / f);
+  const g = ctx.createGain(); g.connect(dest);
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.linearRampToValueAtTime(peak, when + 0.004);
+  g.gain.setTargetAtTime(peak * 0.0003, when + 0.004, tau * 0.6);
+  g.gain.cancelScheduledValues(end);
+  g.gain.setTargetAtTime(0.0001, end, 0.09);
+  const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 0.7;
+  lp.frequency.setValueAtTime(Math.min(7000, f * (isBass ? 5 : 9) * (0.5 + 0.5 * vel)), when);
+  lp.frequency.setTargetAtTime(Math.max(300, f * 1.6), when, 0.22);
+  lp.connect(g);
+  [[0, 'sawtooth', 0.55], [4, 'triangle', 0.5]].forEach(([cents, type, a]) => {
+    const o = ctx.createOscillator(), og = ctx.createGain(); o.type = type; o.frequency.value = f; o.detune.value = cents; og.gain.value = a;
+    o.connect(og); og.connect(lp); o.start(when); o.stop(end + 0.7);
+  });
+  const nz = ctx.createBufferSource(); nz.buffer = getNoise(ctx);
+  const hp = ctx.createBiquadFilter(); hp.type = 'bandpass'; hp.frequency.value = Math.min(4500, f * 4); hp.Q.value = 1.2;
+  const ng = ctx.createGain(); ng.gain.setValueAtTime(peak * 0.9, when); ng.gain.setTargetAtTime(0.0001, when, 0.01);
+  nz.connect(hp); hp.connect(ng); ng.connect(dest); nz.start(when); nz.stop(when + 0.08);
+}
+// 리드: 지속음 + 늦게 시작하는 비브라토 (멜로디가 끊기지 않고 노래처럼 들리도록)
+function leadNote(ctx, dest, f, when, dur, vel) {
+  const end = when + Math.max(dur, 0.2), peak = 0.15 * Math.pow(vel, 1.1);
+  const g = ctx.createGain(); g.connect(dest);
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.linearRampToValueAtTime(peak, when + 0.03);
+  g.gain.setTargetAtTime(peak * 0.78, when + 0.03, 0.35);
+  g.gain.cancelScheduledValues(end);
+  g.gain.setTargetAtTime(0.0001, end, 0.07);
+  const lfo = ctx.createOscillator(), lg = ctx.createGain(); lfo.frequency.value = 5.3;
+  lg.gain.setValueAtTime(0, when); lg.gain.linearRampToValueAtTime(5, when + Math.max(0.35, 0.2)); // 센트
+  lfo.connect(lg);
+  const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = Math.min(5000, f * 6); lp.connect(g);
+  [['sine', 1, 0.7], ['triangle', 1, 0.35], ['sine', 2, 0.14]].forEach(([type, mul, a]) => {
+    const o = ctx.createOscillator(), og = ctx.createGain(); o.type = type; o.frequency.value = f * mul; og.gain.value = a;
+    lg.connect(o.detune); o.connect(og); og.connect(lp); o.start(when); o.stop(end + 0.5);
+  });
+  lfo.start(when); lfo.stop(end + 0.5);
+}
+function playEvent(ctx, dest, e, when, dur) {
+  const f = 440 * Math.pow(2, (e.midi - 69) / 12);
+  const lead = $('#pl-lead').value === 'lead';
+  if (e.kind === 'm') {
+    if (lead) leadNote(ctx, dest, f, when, dur, e.vel);
+    else if (S.instrument === 'guitar') guitarNote(ctx, dest, f, when, dur, e.vel, false);
+    else pianoNote(ctx, dest, f, when, dur, e.vel, true);
+  } else if (S.instrument === 'guitar') guitarNote(ctx, dest, f, when, dur, e.vel, e.kind === 'b');
+  else pianoNote(ctx, dest, f, when, dur, e.vel, false);
 }
 function setPlayUi(on) {
   const b = $('#play'); b.textContent = on ? '■ 멈추기' : '▶ 들어보기'; b.classList.toggle('pri', !on);
@@ -1518,24 +1795,40 @@ function startPlay() {
   const AC = window.AudioContext || window.webkitAudioContext;
   if (!AC) { say('이 브라우저는 소리 재생을 지원하지 않습니다.', true); return; }
   stopPlay();
-  const pb = CA.buildPlayback(CA.parseScore(S.outDoc), S.slots, S.shift, { melody: $('#pl-mel').checked, chords: $('#pl-chd').checked, style: $('#pl-style').value });
+  const pb = CA.buildPlayback(CA.parseScore(S.outDoc), S.slots, S.shift, {
+    melody: $('#pl-mel').checked, chords: $('#pl-chd').checked, style: $('#pl-style').value,
+    instrument: S.instrument, bpm: S.bpm, rit: $('#pl-rit').checked,
+  });
   if (!pb.events.length) { say('들을 소리가 없습니다. 멜로디나 코드 반주를 켜 주세요.', true); return; }
   ac = new AC(); if (ac.state === 'suspended') ac.resume();
-  const master = ac.createGain(); master.gain.value = 0.9;
-  const comp = ac.createDynamicsCompressor(); master.connect(comp); comp.connect(ac.destination);
-  const spq = 60 / S.bpm, t0 = ac.currentTime + 0.2;
-  for (const e of pb.events) voice(ac, master, 440 * Math.pow(2, (e.midi - 69) / 12), t0 + e.t * spq, Math.max(0.12, e.dur * spq), e.vel, e.kind);
+  const bus = buildBus(ac);
+  const tm = CA.makeTimeMap(pb.total, S.bpm, $('#pl-rit').checked);
   let stamps = [];
   try { if (osmd) { stamps = cursorStamps(); osmd.cursor.show(); } } catch (e) { stamps = []; }
-  playSt = { t0, spq, total: pb.total, starts: pb.starts, stamps, ci: 0, mi: -1, top: -1 };
+  playSt = { t0: ac.currentTime + 0.25, tm, total: pb.total, starts: pb.starts, stamps, ci: 0, mi: -1, top: -1, events: pb.events, ei: 0, bus };
   setPlayUi(true);
+  schedule();
   raf = requestAnimationFrame(tick);
+}
+// 앞으로 3초 안에 울릴 소리만 미리 예약한다 (긴 곡도 부담이 없고, 템포 변화도 반영)
+function schedule() {
+  const P = playSt; if (!P || !ac) return;
+  const horizon = ac.currentTime + 3;
+  while (P.ei < P.events.length) {
+    const e = P.events[P.ei];
+    const when = P.t0 + P.tm.sec(e.t);
+    if (when > horizon) break;
+    const dur = Math.max(0.12, P.tm.sec(e.t + e.dur) - P.tm.sec(e.t));
+    playEvent(ac, P.bus, e, Math.max(when, ac.currentTime), dur);
+    P.ei++;
+  }
 }
 function tick() {
   if (!ac || !playSt) return;
   const P = playSt;
-  const q = (ac.currentTime - P.t0) / P.spq;
-  if (q > P.total + 1.2) { stopPlay(); return; }
+  schedule();
+  const q = P.tm.qAt(Math.max(0, ac.currentTime - P.t0));
+  if (q > P.total + 2.5) { stopPlay(); return; }
   if (P.stamps.length) {
     let moved = false;
     try {
@@ -1579,6 +1872,21 @@ function setShift(n, f1) {
   S.shift = n; S.targetF1 = f1 == null ? null : f1;
   refresh();
 }
+/* 자체 점검용: 주소 끝에 #test 가 있을 때만 */
+if (location.hash === '#test') {
+  window.__render = async function (inst, style, lead) {
+    S.instrument = inst; syncControls(); $('#pl-style').value = style; $('#pl-lead').value = lead;
+    const pb = CA.buildPlayback(CA.parseScore(S.outDoc), S.slots, S.shift, { melody: true, chords: true, style, instrument: inst, bpm: S.bpm, rit: true });
+    const tm = CA.makeTimeMap(pb.total, S.bpm, true), sr = 22050, secs = tm.sec(pb.total) + 3;
+    const oc = new OfflineAudioContext(2, Math.ceil(sr * secs), sr), bus = buildBus(oc);
+    for (const e of pb.events) playEvent(oc, bus, e, 0.1 + tm.sec(e.t), Math.max(0.12, tm.sec(e.t + e.dur) - tm.sec(e.t)));
+    const buf = await oc.startRendering(), d = buf.getChannelData(0);
+    let peak = 0, sum = 0, clip = 0, nan = 0;
+    for (let i = 0; i < d.length; i++) { const v = d[i]; if (v !== v) nan++; const a = Math.abs(v); if (a > peak) peak = a; if (a >= 0.999) clip++; sum += v * v; }
+    const half = Math.floor(d.length / 2); let late = 0; for (let i = half; i < d.length; i++) late += d[i] * d[i];
+    return { secs: +secs.toFixed(1), peak: +peak.toFixed(3), rms: +Math.sqrt(sum / d.length).toFixed(4), clip, nan, lateRms: +Math.sqrt(late / (d.length - half)).toFixed(4) };
+  };
+}
 function wire() {
   $('#open').addEventListener('click', () => $('#file').click());
   $('#file').addEventListener('change', (e) => { openFile(e.target.files[0]); e.target.value = ''; });
@@ -1593,7 +1901,8 @@ function wire() {
   $('#play').addEventListener('click', () => { if (ac) stopPlay(); else startPlay(); });
   $('#bpm').addEventListener('input', (e) => { S.bpm = +e.target.value; $('#bpmv').textContent = '♩=' + S.bpm; });
   $('#bpm').addEventListener('change', () => { if (ac) startPlay(); });
-  ['#pl-mel', '#pl-chd', '#pl-style'].forEach((id) => $(id).addEventListener('change', () => { if (ac) startPlay(); }));
+  $('#bpm').addEventListener('change', () => { if (ac) startPlay(); });
+  ['#pl-mel', '#pl-chd', '#pl-style', '#pl-lead', '#pl-rit'].forEach((id) => $(id).addEventListener('change', () => { if (ac) startPlay(); }));
   $('#reset').addEventListener('click', () => { S.preferFlat = false; setShift(0, null); });
   $('#target').addEventListener('change', (e) => {
     const f = +e.target.value, minor = isMinor();
