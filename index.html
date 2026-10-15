@@ -71,6 +71,10 @@ select{border:1px solid var(--line);background:var(--surface);border-radius:7px;
 .msg.err{background:var(--warn-soft);color:var(--ink);border:1px solid var(--warn)}
 .msg[hidden]{display:none}
 .drop{outline:2px dashed var(--accent);outline-offset:4px}
+.player{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;margin-bottom:10px}
+.player input[type=range]{accent-color:var(--accent);width:130px}
+.player .prog{flex:1 1 120px;min-width:100px;height:6px}
+.bar.now{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
 .scorehead{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px 14px;margin-bottom:10px}
 .scorehead h2{font-size:16px;font-weight:600}
 .paper{background:var(--paper);color:var(--paper-ink);border-radius:8px;border:1px solid var(--line);padding:10px 8px 14px;overflow-x:auto;min-height:220px}
@@ -225,6 +229,14 @@ pre.chart{margin:0;padding:10px 12px;border-radius:8px;background:var(--surface2
           <button type="button" class="btn sm" id="save-xml">MusicXML 저장</button>
         </span>
       </div>
+    </div>
+    <div class="player" role="group" aria-label="소리로 듣기">
+      <button type="button" class="btn pri" id="play">▶ 들어보기</button>
+      <label class="check">템포 <input type="range" id="bpm" min="40" max="200" step="1"> <span class="key-readout" id="bpmv"></span></label>
+      <label class="check"><input type="checkbox" id="pl-mel" checked> 멜로디</label>
+      <label class="check"><input type="checkbox" id="pl-chd" checked> 코드 반주</label>
+      <select id="pl-style" aria-label="반주 방식"><option value="strum">스트럼</option><option value="arp">아르페지오</option></select>
+      <div class="meter prog" id="prog" hidden><i style="width:0"></i></div>
     </div>
     <div class="paper"><div id="score"></div></div>
   </section>
@@ -423,7 +435,8 @@ function parseScore(doc, opts) {
             midi = (oc + 1) * 12 + LETTER_PC[LETTERS.indexOf(st)] + Math.round(al);
           }
           const staff = parseInt(childText(ch, 'staff') || '1', 10);
-          M.notes.push({ pi, staff, voice: childText(ch, 'voice') || '1', t: start, dur, midi, rest: isRest, grace: isGrace, chord: isChord });
+          const ties = [...ch.children].filter((c) => c.nodeName === 'tie').map((c) => c.getAttribute('type'));
+          M.notes.push({ pi, staff, voice: childText(ch, 'voice') || '1', t: start, dur, midi, rest: isRest, grace: isGrace, chord: isChord, tieStop: ties.includes('stop'), tieStart: ties.includes('start') });
           if (midi != null && (pi > 0 || staff > 1)) hasAccomp = true;
           if (!isChord) { prevStart = start; if (!isGrace) cur += dur; }
           maxEnd = Math.max(maxEnd, cur, start + dur);
@@ -461,7 +474,18 @@ function parseScore(doc, opts) {
     if (!M.onsets.length) M.onsets = [0];
   }
   resolveModes(measures, opts.mode);
+  let tempo = null;
+  for (const so of rootEl.getElementsByTagName('sound')) { const tv = parseFloat(so.getAttribute('tempo')); if (tv > 0) { tempo = tv; break; } }
+  if (!tempo) {
+    const mm = rootEl.getElementsByTagName('metronome')[0];
+    if (mm) {
+      const f = { whole: 4, half: 2, quarter: 1, eighth: 0.5, '16th': 0.25 }[childText(mm, 'beat-unit')];
+      const pm = parseFloat(childText(mm, 'per-minute'));
+      if (pm > 0 && f) tempo = pm * f * (child(mm, 'beat-unit-dot') ? 1.5 : 1);
+    }
+  }
   return {
+    tempo: tempo ? Math.round(tempo) : null,
     title, parts: partEls.map((pe, i) => ({ index: i, name: names[pe.getAttribute('id')] || `파트 ${i + 1}` })),
     measures, existing, hasAccomp, nMeasures: nM,
   };
@@ -856,6 +880,69 @@ function rate(slots, total, instrument) {
   return { score: Math.round(100 * (1 - avg / 2.2)), open, barre, hard, black, n: slots.length };
 }
 
+/* ---------- 연주(소리) 이벤트 ---------- */
+// infoOut: 조옮김이 반영된 악보를 parseScore한 결과. 시간 단위는 4분음표.
+function buildPlayback(infoOut, slots, shift, opts) {
+  opts = opts || {};
+  const starts = [];
+  let acc = 0;
+  for (const M of infoOut.measures) { starts.push(acc); acc += M.len; }
+  const total = acc;
+  const events = [];
+  if (opts.melody) {
+    const open = new Map();
+    for (const M of infoOut.measures) {
+      for (const n of M.notes) {
+        if (n.rest || n.midi == null || n.grace) continue;
+        const t = starts[M.i] + n.t;
+        const key = n.pi + ':' + n.staff + ':' + n.voice + ':' + n.midi;
+        if (n.tieStop && open.has(key)) {
+          const e = open.get(key);
+          e.dur = t + n.dur - e.t;
+          if (!n.tieStart) open.delete(key);
+          continue;
+        }
+        const e = { t, dur: n.dur, midi: n.midi, kind: 'm', vel: 1 };
+        events.push(e);
+        if (n.tieStart) open.set(key, e);
+      }
+    }
+  }
+  if (opts.chords) {
+    const ss = [...slots].sort((a, b) => a.m - b.m || a.t - b.t);
+    ss.forEach((sl, i) => {
+      const t = starts[sl.m] + sl.t;
+      const nx = ss[i + 1];
+      const end = nx ? starts[nx.m] + nx.t : total;
+      const dur = Math.max(0.25, end - t);
+      const root = mod(sl.root + shift, 12);
+      const bass = sl.bass != null ? mod(sl.bass + shift, 12) : root;
+      const base = 48 + root;
+      const tones = QUAL[sl.q].pcs.map((x) => base + x);
+      const g = groupLen(infoOut.measures[sl.m].ts);
+      const bassMidi = 36 + bass;
+      const put = (tt, d, midi, kind, vel) => { if (tt < t + dur - 1e-6) events.push({ t: tt, dur: Math.min(d, t + dur - tt), midi, kind, vel }); };
+      if (opts.style === 'arp') {
+        const pat = tones.length >= 4 ? [0, 1, 2, 3, 2, 1, 2, 1] : [0, 1, 2, 1, 2, 1, 2, 1];
+        let k = 0;
+        for (let x = 0; x < dur - 1e-6; x += 0.5) {
+          if (Math.abs(x / g - Math.round(x / g)) < 1e-6) put(t + x, g * 1.8, bassMidi, 'b', 1);
+          put(t + x, 1.4, tones[pat[k % pat.length]], 'c', 0.75);
+          k++;
+        }
+      } else {
+        let b = 0;
+        for (let x = 0; x < dur - 1e-6; x += g, b++) {
+          if (b % 2 === 0) put(t + x, g * 2, bassMidi, 'b', 1);
+          tones.forEach((m, i) => put(t + x + i * 0.035, g * 1.6, m, 'c', x === 0 ? 1 : 0.7));
+        }
+      }
+    });
+  }
+  events.sort((a, b) => a.t - b.t);
+  return { events, total, starts };
+}
+
 /* ---------- 예시 악보 (환희의 송가, 공개 도메인) ---------- */
 function sampleXml() {
   const N = (step, oct, dur, type, dots) => `<note><pitch><step>${step}</step><octave>${oct}</octave></pitch><duration>${dur}</duration><voice>1</voice><type>${type}</type>${dots ? '<dot/>' : ''}</note>`;
@@ -877,7 +964,7 @@ function sampleXml() {
 root.CA = {
   QUAL, QUAL_ORDER, LOF, mod, nameForPc, pretty, keyName, keyNameShort, tonicPcOf, fifthsFromTonic, shapeFifths, chordName, mapKey,
   parseScore, analyze, slotsFromExisting, buildOutput, displayChord, chartText, guitarShape, shapePcs, pianoKeys, BLACK, rate,
-  sampleXml, OPEN, E_SHAPE, A_SHAPE, OPEN_STRINGS,
+  buildPlayback, sampleXml, OPEN, E_SHAPE, A_SHAPE, OPEN_STRINGS,
 };
 if (typeof module !== 'undefined' && module.exports) module.exports = root.CA;
 })(typeof window !== 'undefined' ? window : globalThis);
@@ -896,9 +983,9 @@ const S = {
   shift: 0, targetF1: null, preferFlat: false,
   capo: 0, capoView: false, instrument: 'guitar',
   split: 'half', level: 'triad', part: 'all', mode: null,
-  dirty: false, pending: false, fifthsAt: [], lastXml: '', zoom: 1, tab: 'edit',
+  dirty: false, pending: false, fifthsAt: [], lastXml: '', outDoc: null, bpm: 100, zoom: 1, tab: 'edit',
 };
-let osmd = null, seq = 0, downloads = null, confirmTimer = 0, msgTimer = 0;
+let ac = null, raf = 0, playSt = null, osmd = null, seq = 0, downloads = null, confirmTimer = 0, msgTimer = 0;
 
 /* ---------- 도우미 ---------- */
 function say(text, err, keep) {
@@ -958,6 +1045,7 @@ async function loadScore(text, name, isSample) {
     const imported = CA.slotsFromExisting(info);
     S.slots = imported.length ? imported : CA.analyze(info, analysisOpts());
     S.sel = S.slots[0] || null;
+    S.bpm = info.tempo || 100; $('#pl-chd').checked = !info.hasAccomp;
     $('#fname').textContent = isSample ? '예시: 환희의 송가 (베토벤, 공개 도메인)' : name;
     if (imported.length) say(`파일에 들어 있던 코드 ${imported.length}개를 불러왔습니다. 새로 추정하려면 "코드 다시 추천"을 누르세요.`, false, true);
     else if (!isSample) say('멜로디를 분석해 코드를 붙였습니다. 틀린 곳은 아래에서 고쳐 주세요.');
@@ -986,9 +1074,10 @@ function ensureOsmd() {
 }
 async function refresh() {
   const my = ++seq;
+  stopPlay();
   try {
     const out = CA.buildOutput(S.srcDoc, S.info, { shift: S.shift, targetF1: S.targetF1, preferFlat: S.preferFlat, slots: S.slots, capo: S.capo, capoView: capoOn() });
-    S.fifthsAt = out.fifthsAt;
+    S.fifthsAt = out.fifthsAt; S.outDoc = out.doc;
     S.lastXml = '<?xml version="1.0" encoding="UTF-8"?>' + new XMLSerializer().serializeToString(out.doc);
     renderPanels();
     const o = ensureOsmd();
@@ -1015,6 +1104,7 @@ function renderPanels() {
 
 function syncControls() {
   const info = S.info;
+  $('#bpm').value = S.bpm; $('#bpmv').textContent = '♩=' + S.bpm;
   $('#scoretitle').textContent = info.title || S.fname || '악보';
   const sel = $('#part'); sel.textContent = '';
   const all = document.createElement('option'); all.value = 'all'; all.textContent = info.parts.length > 1 ? '모든 파트 분석' : (info.parts[0].name || '파트 1');
@@ -1379,6 +1469,95 @@ async function savePng() {
   } catch (e) { say(e.message || String(e), true); }
 }
 
+/* ---------- 소리로 듣기 ---------- */
+function voice(ctx, dest, freq, when, dur, vel, kind) {
+  const guitar = S.instrument === 'guitar';
+  const g = ctx.createGain();
+  const peak = (kind === 'm' ? 0.2 : kind === 'b' ? 0.2 : 0.075) * vel;
+  const end = when + dur;
+  g.gain.setValueAtTime(0.0001, when);
+  g.gain.linearRampToValueAtTime(peak, when + (kind === 'm' ? 0.015 : 0.006));
+  if (kind === 'm') { g.gain.exponentialRampToValueAtTime(peak * 0.55, when + Math.min(dur, 0.6)); }
+  else { g.gain.exponentialRampToValueAtTime(peak * 0.22, when + Math.min(dur, 1.6)); }
+  g.gain.setValueAtTime(g.gain.value || peak * 0.3, end);
+  g.gain.exponentialRampToValueAtTime(0.0001, end + 0.14);
+  let out = g;
+  if (kind !== 'm' && guitar) {
+    const f = ctx.createBiquadFilter(); f.type = 'lowpass';
+    f.frequency.setValueAtTime(Math.min(6000, freq * 7 + 600), when);
+    f.frequency.exponentialRampToValueAtTime(Math.max(350, freq * 1.8), when + 0.7);
+    f.connect(g); out = f;
+  }
+  const o1 = ctx.createOscillator(), o2 = ctx.createOscillator(), g2 = ctx.createGain();
+  o1.type = kind !== 'm' && guitar ? 'sawtooth' : 'triangle'; o2.type = 'sine';
+  o1.frequency.value = freq; o2.frequency.value = freq * 2; g2.gain.value = kind === 'm' ? 0.18 : 0.3;
+  o1.connect(out); o2.connect(g2); g2.connect(out); g.connect(dest);
+  o1.start(when); o2.start(when); o1.stop(end + 0.2); o2.stop(end + 0.2);
+}
+function setPlayUi(on) {
+  const b = $('#play'); b.textContent = on ? '■ 멈추기' : '▶ 들어보기'; b.classList.toggle('pri', !on);
+  $('#prog').hidden = !on;
+}
+function stopPlay() {
+  cancelAnimationFrame(raf); raf = 0;
+  if (ac) { try { ac.close(); } catch (e) { /* 무시 */ } ac = null; }
+  if (playSt) { try { osmd.cursor.hide(); } catch (e) { /* 무시 */ } }
+  playSt = null;
+  document.querySelectorAll('.bar.now').forEach((b) => b.classList.remove('now'));
+  if (S.info) setPlayUi(false);
+}
+function cursorStamps() {
+  const c = osmd.cursor; c.reset();
+  const st = []; let guard = 0;
+  const it = () => c.Iterator || c.iterator;
+  while (!it().EndReached && guard++ < 6000) { st.push((it().CurrentSourceTimestamp || it().currentTimeStamp).RealValue * 4); c.next(); }
+  c.reset();
+  return st;
+}
+function startPlay() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) { say('이 브라우저는 소리 재생을 지원하지 않습니다.', true); return; }
+  stopPlay();
+  const pb = CA.buildPlayback(CA.parseScore(S.outDoc), S.slots, S.shift, { melody: $('#pl-mel').checked, chords: $('#pl-chd').checked, style: $('#pl-style').value });
+  if (!pb.events.length) { say('들을 소리가 없습니다. 멜로디나 코드 반주를 켜 주세요.', true); return; }
+  ac = new AC(); if (ac.state === 'suspended') ac.resume();
+  const master = ac.createGain(); master.gain.value = 0.9;
+  const comp = ac.createDynamicsCompressor(); master.connect(comp); comp.connect(ac.destination);
+  const spq = 60 / S.bpm, t0 = ac.currentTime + 0.2;
+  for (const e of pb.events) voice(ac, master, 440 * Math.pow(2, (e.midi - 69) / 12), t0 + e.t * spq, Math.max(0.12, e.dur * spq), e.vel, e.kind);
+  let stamps = [];
+  try { if (osmd) { stamps = cursorStamps(); osmd.cursor.show(); } } catch (e) { stamps = []; }
+  playSt = { t0, spq, total: pb.total, starts: pb.starts, stamps, ci: 0, mi: -1, top: -1 };
+  setPlayUi(true);
+  raf = requestAnimationFrame(tick);
+}
+function tick() {
+  if (!ac || !playSt) return;
+  const P = playSt;
+  const q = (ac.currentTime - P.t0) / P.spq;
+  if (q > P.total + 1.2) { stopPlay(); return; }
+  if (P.stamps.length) {
+    let moved = false;
+    try {
+      while (P.ci + 1 < P.stamps.length && P.stamps[P.ci + 1] <= q + 1e-6) { osmd.cursor.next(); P.ci++; moved = true; }
+      if (moved) {
+        const el = osmd.cursor.cursorElement;
+        if (el && Math.abs(el.offsetTop - P.top) > 30) { P.top = el.offsetTop; el.scrollIntoView({ block: 'center', behavior: 'smooth' }); }
+      }
+    } catch (e) { P.stamps = []; }
+  }
+  let mi = 0;
+  while (mi + 1 < P.starts.length && P.starts[mi + 1] <= q) mi++;
+  if (mi !== P.mi) {
+    const kids = $('#bars').children;
+    if (kids[P.mi]) kids[P.mi].classList.remove('now');
+    if (kids[mi] && q >= 0) kids[mi].classList.add('now');
+    P.mi = mi;
+  }
+  $('#prog i').style.width = Math.max(0, Math.min(100, (q / P.total) * 100)) + '%';
+  raf = requestAnimationFrame(tick);
+}
+
 /* ---------- 이벤트 ---------- */
 function setTab(t) {
   S.tab = t;
@@ -1411,6 +1590,10 @@ function wire() {
   const norm = (n) => { let x = mod(n + 5, 12) - 5; return x; };
   $('#up').addEventListener('click', () => setShift(norm(S.shift + 1), null));
   $('#down').addEventListener('click', () => setShift(norm(S.shift - 1), null));
+  $('#play').addEventListener('click', () => { if (ac) stopPlay(); else startPlay(); });
+  $('#bpm').addEventListener('input', (e) => { S.bpm = +e.target.value; $('#bpmv').textContent = '♩=' + S.bpm; });
+  $('#bpm').addEventListener('change', () => { if (ac) startPlay(); });
+  ['#pl-mel', '#pl-chd', '#pl-style'].forEach((id) => $(id).addEventListener('change', () => { if (ac) startPlay(); }));
   $('#reset').addEventListener('click', () => { S.preferFlat = false; setShift(0, null); });
   $('#target').addEventListener('change', (e) => {
     const f = +e.target.value, minor = isMinor();
